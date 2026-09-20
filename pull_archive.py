@@ -25,11 +25,14 @@ or, for a slice that fits in memory, pandas:
 file (memory-bounded, one row group at a time) for tools that want a single
 file. At fleet scale that file is large; the directory form is usually better.
 
-Only rows OLDER than the hot window (14 days) are in S3. The most recent
-~3 weeks live in Postgres. `--hot` also snapshots those into the same
-directory (under `hot/`) using the read-only `dashboard_readonly` role, so
-one directory holds the complete corpus. The snapshot is replaced wholesale
-each run. Hot and archive overlap by up to the 7-day prune buffer, so
+Only sweep rows OLDER than the hot window (14 days) are in S3. The most
+recent ~3 weeks of sweeps live in Postgres, and so -- permanently -- do the
+small tables that give the sweeps meaning: `units`, `placements` (where each
+unit is and has been) and `unit_telemetry` (boots, heartbeats, thermal
+events). `--hot` snapshots all of that using the read-only
+`dashboard_readonly` role: sweeps under `hot/`, the small tables under
+`meta/`, so one directory holds the complete corpus. Snapshots are replaced
+wholesale each run. Hot and archive overlap by up to the 7-day prune buffer, so
 deduplicate on (unit_id, client_row_id) when reading both -- the printed
 DuckDB view does this.
 
@@ -46,7 +49,7 @@ Usage:
     python pull_archive.py --profile ens-reader
     python pull_archive.py --bucket ens-archive-mirror   # if primary is unavailable
     python pull_archive.py --combine all_sweeps.parquet
-    ENS_PG_PASSWORD=... python pull_archive.py --hot   # archive + current Postgres rows
+    ENS_PG_PASSWORD=... python pull_archive.py --hot   # archive + current Postgres rows + units/placements/telemetry
 """
 
 import argparse
@@ -59,6 +62,10 @@ from botocore.exceptions import ClientError, NoCredentialsError
 DEFAULT_BUCKET = "ens-archive"
 PREFIX = "sweeps/"
 HOT_DIR = "hot"
+META_DIR = "meta"
+# Small Postgres-only tables pulled whole with --hot. Never archived to S3; this is
+# the only route a data-only user has to them. current_placements is a view.
+META_TABLES = ["units", "placements", "unit_telemetry", "current_placements"]
 
 PG_HOST = "aws-0-ca-central-1.pooler.supabase.com"   # session pooler; the direct endpoint is IPv6-only
 PG_USER = "dashboard_readonly.tsfoesuxyulcjafdesey"  # role.projectref -- the suffix is required by the pooler
@@ -201,6 +208,57 @@ def snapshot_hot(dest: str, password: str, host: str) -> int:
     return rows
 
 
+def snapshot_meta(dest: str, password: str, host: str, csv: bool) -> dict:
+    """Pull each small table in META_TABLES whole into dest/meta/<table>.parquet
+    (and dest/<table>.csv when csv=True). Column types are inferred; timestamps,
+    UUIDs, MAC addresses and JSONB become strings so the files are portable.
+    Returns {table: row_count}."""
+    import json, decimal, datetime, uuid
+    import psycopg2
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import pyarrow.csv as pcsv
+
+    def plain(v):
+        if v is None or isinstance(v, (bool, int, float, str)):
+            return v
+        if isinstance(v, (datetime.datetime, datetime.date)):
+            return v.isoformat()
+        if isinstance(v, decimal.Decimal):
+            return float(v)
+        if isinstance(v, (dict, list)):
+            return json.dumps(v, separators=(",", ":"))
+        return str(v)   # uuid, macaddr, anything else
+
+    meta_dir = os.path.join(dest, META_DIR)
+    os.makedirs(meta_dir, exist_ok=True)
+    conn = psycopg2.connect(host=host, port=5432, dbname=PG_DB, user=PG_USER,
+                            password=password, sslmode="require", options="-c timezone=UTC")
+    counts = {}
+    try:
+        for table in META_TABLES:
+            with conn.cursor() as cur:
+                cur.execute(f"select * from {table}")
+                cols = [c[0] for c in cur.description]
+                rows = cur.fetchall()
+            data = {c: [plain(r[i]) for r in rows] for i, c in enumerate(cols)}
+            # all-null columns cannot be inferred; make them strings
+            arrays = []
+            for c in cols:
+                vals = data[c]
+                arrays.append(pa.array(vals, type=pa.string()) if all(v is None for v in vals) else pa.array(vals))
+            tbl = pa.Table.from_arrays(arrays, names=cols)
+            out = os.path.join(meta_dir, f"{table}.parquet")
+            pq.write_table(tbl, out + ".part", compression="zstd")
+            os.replace(out + ".part", out)
+            if csv:
+                pcsv.write_csv(tbl, os.path.join(dest, f"{table}.csv"))
+            counts[table] = len(rows)
+    finally:
+        conn.close()
+    return counts
+
+
 def write_csv(dest: str) -> None:
     """Everything under dest (archive + hot), deduplicated on (unit_id, client_row_id),
     as one CSV for Excel-style tools. Excel stops at 1,048,576 rows -- about ten
@@ -272,6 +330,10 @@ def main():
         print(f"Snapshotting current Postgres rows from {args.pg_host} ...")
         hot_rows = snapshot_hot(args.dest, pg_password, args.pg_host)
         print(f"Hot snapshot: {hot_rows:,} rows -> {os.path.join(os.path.abspath(args.dest), HOT_DIR)}")
+        counts = snapshot_meta(args.dest, pg_password, args.pg_host, csv=args.csv)
+        print("Units, placements, telemetry -> " + os.path.join(os.path.abspath(args.dest), META_DIR) + ": "
+              + ", ".join(f"{t} {n:,}" for t, n in counts.items())
+              + ("  (+ CSVs)" if args.csv else ""))
 
     if args.combine:
         print(f"Combining into {args.combine} ...")
@@ -286,6 +348,7 @@ def main():
     print('  con.sql("""create view sweeps as')
     print(f"    select * from read_parquet(['{d}/sweeps/**/*.parquet', '{d}/hot/*.parquet'], union_by_name=true)")
     print('    qualify row_number() over (partition by unit_id, client_row_id order by archived_at nulls last) = 1""")')
+    print(f"  Location per unit: read_parquet('{d}/meta/current_placements.parquet'); full history in meta/placements.parquet.")
 
 
 if __name__ == "__main__":

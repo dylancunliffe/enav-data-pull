@@ -50,11 +50,17 @@ export ENS_PG_PASSWORD="the password"; python3 pull_archive.py --profile ens-rea
 
 ## What you get
 
-- `ens_data/sweeps.csv` — everything, one row per reading. Opens in Excel
-  (up to Excel's ~1 million row limit — about ten unit-days).
-- `ens_data/sweeps/` and `ens_data/hot/` — the same data as Parquet, for
-  Python (`pandas.read_parquet`) or DuckDB. The script prints a DuckDB view
-  that reads both and removes the small overlap between them.
+- `ens_data/sweeps/` and `ens_data/hot/` — every sweep reading, as Parquet
+  (archive and live-database snapshot respectively; they overlap by up to a
+  week). The script prints a DuckDB view that reads both and removes the overlap.
+- `ens_data/meta/` — `units`, `placements` (where each unit is and has been),
+  `current_placements`, `unit_telemetry` (boots, heartbeats, thermal events),
+  as Parquet. These exist only in the live database, so `--hot` is required to get them.
+- With `--csv`: `sweeps.csv`, `units.csv`, `placements.csv`,
+  `current_placements.csv`, `unit_telemetry.csv` in `ens_data/`. Excel opens
+  the small ones fine; `sweeps.csv` exceeds Excel's ~1 million rows after
+  about ten unit-days and is tens of GB for a fleet — drop `--csv` once the
+  fleet is running and work from the Parquet files.
 
 The first run downloads everything; later runs fetch only what is new.
 
@@ -62,8 +68,8 @@ The first run downloads everything; later runs fetch only what is new.
 
 | Flag | Effect |
 |---|---|
-| `--hot` | Also snapshot the current live-database rows (needs `ENS_PG_PASSWORD`) |
-| `--csv` | Also write `sweeps.csv` |
+| `--hot` | Also snapshot the live database: recent sweeps plus units, placements and telemetry (needs `ENS_PG_PASSWORD`) |
+| `--csv` | Also write CSVs of everything pulled |
 | `--no-s3` | Skip the archive; live database only (no AWS credentials needed) |
 | `--profile NAME` | AWS CLI profile to use |
 | `--dest DIR` | Where to put the files (default `./archive`) |
